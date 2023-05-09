@@ -6,21 +6,17 @@ import warnings
 from .event_handling import combine_event_functions
 
 
-_all_callback_names = ['callback_step', 'callback_accept_step', 'callback_reject_step']
-_all_adjoint_callback_names = [name + '_adjoint' for name in _all_callback_names]
-_null_callback = lambda *args, **kwargs: None
-
 def _handle_unused_kwargs(solver, unused_kwargs):
     if len(unused_kwargs) > 0:
         warnings.warn('{}: Unexpected arguments {}'.format(solver.__class__.__name__, unused_kwargs))
 
 
 def _linf_norm(tensor):
-    return tensor.abs().max()
+    return tensor.max()
 
 
 def _rms_norm(tensor):
-    return tensor.abs().pow(2).mean().sqrt()
+    return tensor.pow(2).mean().sqrt()
 
 
 def _zero_norm(tensor):
@@ -47,39 +43,37 @@ def _select_initial_step(func, t0, y0, order, rtol, atol, norm, f0=None):
     dtype = y0.dtype
     device = y0.device
     t_dtype = t0.dtype
-    t0 = t0.to(t_dtype)
+    t0 = t0.to(dtype)
 
     if f0 is None:
         f0 = func(t0, y0)
 
     scale = atol + torch.abs(y0) * rtol
 
-    d0 = norm(y0 / scale).abs()
-    d1 = norm(f0 / scale).abs()
+    d0 = norm(y0 / scale)
+    d1 = norm(f0 / scale)
 
     if d0 < 1e-5 or d1 < 1e-5:
         h0 = torch.tensor(1e-6, dtype=dtype, device=device)
     else:
         h0 = 0.01 * d0 / d1
-    h0 = h0.abs()
 
     y1 = y0 + h0 * f0
     f1 = func(t0 + h0, y1)
 
-    d2 = torch.abs(norm((f1 - f0) / scale) / h0)
+    d2 = norm((f1 - f0) / scale) / h0
 
     if d1 <= 1e-15 and d2 <= 1e-15:
         h1 = torch.max(torch.tensor(1e-6, dtype=dtype, device=device), h0 * 1e-3)
     else:
         h1 = (0.01 / max(d1, d2)) ** (1. / float(order + 1))
-    h1 = h1.abs()
 
     return torch.min(100 * h0, h1).to(t_dtype)
 
 
 def _compute_error_ratio(error_estimate, rtol, atol, y0, y1, norm):
     error_tol = atol + rtol * torch.max(y0.abs(), y1.abs())
-    return norm(error_estimate / error_tol).abs()
+    return norm(error_estimate / error_tol)
 
 
 @torch.no_grad()
@@ -182,9 +176,7 @@ class _PerturbFunc(torch.nn.Module):
         # This dtype change here might be buggy.
         # The exact time value should be determined inside the solver,
         # but this can slightly change it due to numerical differences during casting.
-        if torch.is_complex(t):
-            t = t.real
-        t = t.to(y.abs().dtype)
+        t = t.to(y.dtype)
         if perturb is Perturb.NEXT:
             # Replace with next smallest representable value.
             t = _nextafter(t, t + 1)
@@ -206,9 +198,6 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
         # Combine event functions if the output is multivariate.
         event_fn = combine_event_functions(event_fn, t[0], y0)
 
-    # Keep reference to original func as passed in
-    original_func = func
-
     # Normalise to tensor (non-tupled) input
     shapes = None
     is_tuple = not isinstance(y0, torch.Tensor)
@@ -221,6 +210,7 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
         func = _TupleFunc(func, shapes)
         if event_fn is not None:
             event_fn = _TupleInputOnlyFunc(event_fn, shapes)
+    _assert_floating('y0', y0)
 
     # Normalise method and options
     if options is None:
@@ -309,38 +299,6 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
 
     # Add perturb argument to func.
     func = _PerturbFunc(func)
-
-    # Add callbacks to wrapped_func
-    callback_names = set()
-    for callback_name in _all_callback_names:
-        try:
-            callback = getattr(original_func, callback_name)
-        except AttributeError:
-            setattr(func, callback_name, _null_callback)
-        else:
-            if callback is not _null_callback:
-                callback_names.add(callback_name)
-                # At the moment all callbacks have the arguments (t0, y0, dt).
-                # These will need adjusting on a per-callback basis if that changes in the future.
-                if is_tuple:
-                    def callback(t0, y0, dt, _callback=callback):
-                        y0 = _flat_to_shape(y0, (), shapes)
-                        return _callback(t0, y0, dt)
-                if t_is_reversed:
-                    def callback(t0, y0, dt, _callback=callback):
-                        return _callback(-t0, y0, dt)
-            setattr(func, callback_name, callback)
-    for callback_name in _all_adjoint_callback_names:
-        try:
-            callback = getattr(original_func, callback_name)
-        except AttributeError:
-            pass
-        else:
-            setattr(func, callback_name, callback)
-
-    invalid_callbacks = callback_names - SOLVERS[method].valid_callbacks()
-    if len(invalid_callbacks) > 0:
-        warnings.warn("Solver '{}' does not support callbacks {}".format(method, invalid_callbacks))
 
     return shapes, func, y0, t, rtol, atol, method, options, event_fn, t_is_reversed
 

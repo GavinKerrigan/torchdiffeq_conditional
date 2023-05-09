@@ -56,11 +56,9 @@ def _runge_kutta_step(func, y0, f0, t0, dt, t1, tableau):
         calculating these terms.
     """
 
-    t_dtype = y0.abs().dtype
-
-    t0 = t0.to(t_dtype)
-    dt = dt.to(t_dtype)
-    t1 = t1.to(t_dtype)
+    t0 = t0.to(y0.dtype)
+    dt = dt.to(y0.dtype)
+    t1 = t1.to(y0.dtype)
 
     # We use an unchecked assign to put data into k without incrementing its _version counter, so that the backward
     # doesn't throw an (overzealous) error about in-place correctness. We know that it's actually correct.
@@ -121,9 +119,7 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
     tableau: _ButcherTableau
     mid: torch.Tensor
 
-    def __init__(self, func, y0, rtol, atol,
-                 min_step=0,
-                 max_step=float('inf'),
+    def __init__(self, func, y0, rtol, atol, z=None, z_xs=None, z_idxs=None, forward_process=None,
                  first_step=None,
                  step_t=None,
                  jump_t=None,
@@ -137,14 +133,12 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
 
         # We use mixed precision. y has its original dtype (probably float32), whilst all 'time'-like objects use
         # `dtype` (defaulting to float64).
-        dtype = torch.promote_types(dtype, y0.abs().dtype)
+        dtype = torch.promote_types(dtype, y0.dtype)
         device = y0.device
 
         self.func = func
         self.rtol = torch.as_tensor(rtol, dtype=dtype, device=device)
         self.atol = torch.as_tensor(atol, dtype=dtype, device=device)
-        self.min_step = torch.as_tensor(min_step, dtype=dtype, device=device)
-        self.max_step = torch.as_tensor(max_step, dtype=dtype, device=device)
         self.first_step = None if first_step is None else torch.as_tensor(first_step, dtype=dtype, device=device)
         self.safety = torch.as_tensor(safety, dtype=dtype, device=device)
         self.ifactor = torch.as_tensor(ifactor, dtype=dtype, device=device)
@@ -162,11 +156,11 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
                                        c_error=self.tableau.c_error.to(device=device, dtype=y0.dtype))
         self.mid = self.mid.to(device=device, dtype=y0.dtype)
 
-    @classmethod
-    def valid_callbacks(cls):
-        return super(RKAdaptiveStepsizeODESolver, cls).valid_callbacks() | {'callback_step',
-                                                                            'callback_accept_step',
-                                                                            'callback_reject_step'}
+        # Conditioning information
+        self.z = z
+        self.z_xs = z_xs
+        self.z_idxs = z_idxs
+        self.forward_process = forward_process
 
     def _before_integrate(self, t):
         t0 = t[0]
@@ -224,7 +218,6 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
     def _adaptive_step(self, rk_state):
         """Take an adaptive Runge-Kutta step to integrate the ODE."""
         y0, f0, _, t0, dt, interp_coeff = rk_state
-        self.func.callback_step(t0, y0, dt)
         t1 = t0 + dt
         # dtypes: self.y0.dtype (probably float32); self.dtype (probably float64)
         # used for state and timelike objects respectively.
@@ -277,13 +270,6 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         ########################################################
         error_ratio = _compute_error_ratio(y1_error, self.rtol, self.atol, y0, y1, self.norm)
         accept_step = error_ratio <= 1
-
-        # Handle min max stepping
-        if dt > self.max_step:
-            accept_step = False
-        if dt <= self.min_step:
-            accept_step = True
-
         # dtypes:
         # error_ratio.dtype == self.dtype
 
@@ -291,7 +277,6 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         #                   Update RK State                    #
         ########################################################
         if accept_step:
-            self.func.callback_accept_step(t0, y0, dt)
             t_next = t1
             y_next = y1
             interp_coeff = self._interp_fit(y0, y_next, k, dt)
@@ -306,12 +291,22 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
                 f1 = self.func(t_next, y_next, perturb=Perturb.NEXT)
             f_next = f1
         else:
-            self.func.callback_reject_step(t0, y0, dt)
             t_next = t0
             y_next = y0
             f_next = f0
         dt_next = _optimal_step_size(dt, error_ratio, self.safety, self.ifactor, self.dfactor, self.order)
-        dt_next = dt_next.clamp(self.min_step, self.max_step)
+
+
+        ########################################################
+        #                   Conditioning Step                  #
+        ########################################################
+        if self.z is not None:
+            # y_next: shape [n_samples, n_x]
+            # self.z: shape [n_samples, n_cond]
+            z_t = self.forward_process.simulate(t_next, self.z, query_points=self.z_xs).float()
+            y_next[:, self.z_idxs] = z_t  # Set to be conditioning information; z_t: shape [n_samples, n_cond]
+
+
         rk_state = _RungeKuttaState(y_next, f_next, t0, t_next, dt_next, interp_coeff)
         return rk_state
 

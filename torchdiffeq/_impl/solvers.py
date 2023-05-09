@@ -21,10 +21,6 @@ class AdaptiveStepsizeODESolver(metaclass=abc.ABCMeta):
     def _advance(self, next_t):
         raise NotImplementedError
 
-    @classmethod
-    def valid_callbacks(cls):
-        return set()
-
     def integrate(self, t):
         solution = torch.empty(len(t), *self.y0.shape, dtype=self.y0.dtype, device=self.y0.device)
         solution[0] = self.y0
@@ -78,10 +74,6 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
             else:
                 raise ValueError("step_size and grid_constructor are mutually exclusive arguments.")
 
-    @classmethod
-    def valid_callbacks(cls):
-        return {'callback_step'}
-
     @staticmethod
     def _grid_constructor_from_step_size(step_size):
         def _grid_constructor(func, y0, t):
@@ -110,7 +102,6 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         y0 = self.y0
         for t0, t1 in zip(time_grid[:-1], time_grid[1:]):
             dt = t1 - t0
-            self.func.callback_step(t0, y0, dt)
             dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
             y1 = y0 + dy
 
@@ -130,7 +121,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
     def integrate_until_event(self, t0, event_fn):
         assert self.step_size is not None, "Event handling for fixed step solvers currently requires `step_size` to be provided in options."
 
-        t0 = t0.type_as(self.y0.abs())
+        t0 = t0.type_as(self.y0)
         y0 = self.y0
         dt = self.step_size
 
